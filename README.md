@@ -11,7 +11,7 @@ HermesArc is an interpolation library that supporting data transfer between Unit
 
 ## How to use
 
-We will provide sample code later. Current, you can take this as a reference:
+We will provide sample code later. Currently, you can take this as a reference:
 
 ```C#
 using System;
