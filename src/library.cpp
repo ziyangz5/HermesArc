@@ -327,5 +327,5 @@ extern "C" HERMESARC_API void PushLastTensorToUnity(void* renderTexPtr, unsigned
 
 extern "C" HERMESARC_API const char* get_version()
 {
-    return "HermesArc version 0.10";
+    return "HermesArc version 0.90";
 }
