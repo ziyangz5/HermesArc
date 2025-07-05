@@ -3,6 +3,7 @@
 #include <vector>
 #include <cuda_runtime_api.h>
 #include <torch/torch.h>
+#include <torch/script.h>
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -10,14 +11,17 @@
 #include <IUnityGraphics.h>
 #include <IUnityGraphicsD3D12.h>
 #include "library.h"
+#include <c10/util/Exception.h>
+#include <torch/serialize.h>
 
 enum LogLevel {
     LOG_NONE = 0,
     LOG_ERROR = 1,
-    LOG_VERBOSE = 2
+    LOG_VERBOSE = 2,
+    LOG_DEBUG = 3
 };
 
-static int g_logVerbosity = LOG_VERBOSE;
+static int g_logVerbosity = LOG_ERROR;
 
 static void FileLog(const std::string& msg, int level = LOG_VERBOSE)
 {
@@ -39,23 +43,66 @@ static IUnityGraphics*        s_Graphics        = nullptr;
 static IUnityGraphicsD3D12v2* s_GfxD3D12        = nullptr;
 static ID3D12Device*          s_Device          = nullptr;
 static ID3D12CommandAllocator* s_Allocator      = nullptr;
-static ID3D12Resource*        s_Backbuffer      = nullptr;
-static ID3D12Resource*        s_StagingTex      = nullptr;
+static ID3D12Resource*        s_Backbuffers[4]  = {nullptr,nullptr,nullptr, nullptr};
+static ID3D12Resource*        s_StagingTexs[4]   = {nullptr,nullptr,nullptr, nullptr};
 static ID3D12Fence*           s_Fence           = nullptr;
 static HANDLE                 s_FenceEvent      = nullptr;
-static HANDLE                 g_shareH          = nullptr;
-static cudaExternalMemory_t   g_extMem          = nullptr;
+static HANDLE                 g_shareHs[4]          = {nullptr,nullptr,nullptr, nullptr};
+static cudaExternalMemory_t   g_extMems[4]      = {nullptr,nullptr,nullptr, nullptr};
 static uint64_t               g_rowPitch        = 0;
 static size_t                 g_totalBytes      = 0;
 static FrameReadyCallback     g_FrameReadyCb    = nullptr;
 static HANDLE                 g_WaitHandle      = nullptr;
 static unsigned               g_lastWidth       = 0;
 static unsigned               g_lastHeight      = 0;
-static torch::Tensor          g_lastTensor;
+static torch::Tensor          g_lastTensor[4];
+static torch::jit::script::Module net;
 static void noopCudaDeleter(void*) {}
+static ID3D12Resource*        s_OutputStagingTex = nullptr;
+static HANDLE                 g_OutputShareH     = nullptr;
+static cudaExternalMemory_t   g_OutputExtMem     = nullptr;
 
 static void UNITY_INTERFACE_API OnGraphicsDeviceEvent(UnityGfxDeviceEventType eventType);
 extern "C" HERMESARC_API void CALLBACK FrameFenceCallback(PVOID context, BOOLEAN timedOut);
+static uint64_t g_rowPitchArr[4]   = {0,0,0,0};
+static uint64_t g_totalBytesArr[4] = {0,0,0,0};
+static uint64_t g_outputRowPitch    = 0;
+static uint64_t g_outputTotalBytes  = 0;
+static ID3D12Resource* s_OutputStagingBuf = nullptr;
+static HANDLE          g_outputShareH     = nullptr;
+static cudaExternalMemory_t g_outputExtMem = nullptr;
+
+struct TestNetImpl : torch::nn::Module {
+    TestNetImpl() {
+    }
+
+    torch::Tensor forward(torch::Tensor x) {
+        return x;
+    }
+};
+
+
+TORCH_MODULE(TestNet);
+
+static TestNet test_net;
+
+extern "C" HERMESARC_API bool InitializeNeuralNetwork(const char* model_path)
+{
+    try {
+        net = torch::jit::load(model_path);
+        net.to(torch::kCUDA, torch::kFloat32);
+        net.eval();
+        test_net->to(torch::kCUDA, torch::kFloat32);
+        test_net->eval();
+    }
+    catch (const c10::Error& e) {
+        FileLog("Unable to load model.",LOG_ERROR);
+        return false;
+    }
+    FileLog("[Torch] Model loaded.",LOG_VERBOSE);
+    return true;
+}
+
 
 extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API UnityPluginLoad(IUnityInterfaces* unityInterfaces)
 {
@@ -70,12 +117,17 @@ extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API UnityPluginUnload()
     if (s_Graphics)
         s_Graphics->UnregisterDeviceEventCallback(OnGraphicsDeviceEvent);
     if (s_Allocator)    { s_Allocator->Release();    s_Allocator = nullptr; }
-    if (s_StagingTex)   { s_StagingTex->Release();   s_StagingTex = nullptr; }
+
     if (s_Fence)        { s_Fence = nullptr; }
     if (s_FenceEvent)   { CloseHandle(s_FenceEvent); s_FenceEvent = nullptr; }
     if (g_WaitHandle)   { UnregisterWaitEx(g_WaitHandle, INVALID_HANDLE_VALUE); g_WaitHandle = nullptr; }
-    if (g_extMem)       { cudaDestroyExternalMemory(g_extMem); }
-    if (g_shareH)       { CloseHandle(g_shareH); }
+    for (int i = 0;i<4;i++)
+    {
+        if (g_extMems[i])       { cudaDestroyExternalMemory(g_extMems[i]); }
+        if (g_shareHs[i])       { CloseHandle(g_shareHs[i]); }
+        if (s_StagingTexs[i])   { s_StagingTexs[i]->Release();   s_StagingTexs[i] = nullptr; }
+    }
+
 }
 
 static void UNITY_INTERFACE_API OnGraphicsDeviceEvent(UnityGfxDeviceEventType eventType)
@@ -118,214 +170,449 @@ extern "C" HERMESARC_API void RegisterFrameReadyCallback(FrameReadyCallback cb)
     g_FrameReadyCb = cb;
 }
 
-extern "C" HERMESARC_API void CaptureFrameAsync(void* backbufferPtr, unsigned width, unsigned height)
+extern "C" HERMESARC_API void CaptureFrameAsync(
+        void* ptr0, void* ptr1, void* ptr2, void* ptr3,
+        unsigned width, unsigned height)
 {
-    s_Backbuffer = reinterpret_cast<ID3D12Resource*>(backbufferPtr);
+    
+    s_Backbuffers[0] = reinterpret_cast<ID3D12Resource*>(ptr0);
+    s_Backbuffers[1] = reinterpret_cast<ID3D12Resource*>(ptr1);
+    s_Backbuffers[2] = reinterpret_cast<ID3D12Resource*>(ptr2);
+    s_Backbuffers[3] = reinterpret_cast<ID3D12Resource*>(ptr3);
 
+    
     if (!s_Allocator && s_Device)
     {
-        HRESULT hrAlloc = s_Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s_Allocator));
-        if (FAILED(hrAlloc)) { FileLog("[DX12] CreateCommandAllocator failed: " + std::to_string(hrAlloc), LOG_ERROR); return; }
+        HRESULT hr = s_Device->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(&s_Allocator));
+        if (FAILED(hr))
+        {
+            FileLog("[DX12] CreateCommandAllocator failed: " + std::to_string(hr), LOG_ERROR);
+            return;
+        }
     }
 
-    if (!s_StagingTex && s_Device)
+    
+    for (int i = 0; i < 4; ++i)
     {
-        D3D12_RESOURCE_DESC desc = s_Backbuffer->GetDesc();
-        desc.MipLevels = 1;
-        desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (!s_StagingTexs[i] && s_Device)
+        {
+            
+            D3D12_RESOURCE_DESC texDesc = s_Backbuffers[i]->GetDesc();
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout = {};
+            UINT numRows = 0;
+            UINT64 rowBytes = 0, totalBytes = 0;
+            s_Device->GetCopyableFootprints(
+                    &texDesc, 0, 1, 0,
+                    &layout, &numRows, &rowBytes, &totalBytes);
 
-        D3D12_HEAP_PROPERTIES hp = {};
-        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-        hp.CreationNodeMask = 1;
-        hp.VisibleNodeMask = 1;
+            
+            g_rowPitchArr[i]   = layout.Footprint.RowPitch;
+            g_totalBytesArr[i] = totalBytes;
 
-        HRESULT hr = s_Device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&s_StagingTex));
-        if (FAILED(hr)) { FileLog("[DX12] CreateCommittedResource failed: " + std::to_string(hr), LOG_ERROR); return; }
+            
+            D3D12_RESOURCE_DESC bufDesc = {};
+            bufDesc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bufDesc.Alignment        = 0;
+            bufDesc.Width            = totalBytes;
+            bufDesc.Height           = 1;
+            bufDesc.DepthOrArraySize = 1;
+            bufDesc.MipLevels        = 1;
+            bufDesc.Format           = DXGI_FORMAT_UNKNOWN;
+            bufDesc.SampleDesc.Count = 1;
+            bufDesc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            bufDesc.Flags            = D3D12_RESOURCE_FLAG_NONE;
 
-        hr = s_Device->CreateSharedHandle(s_StagingTex, nullptr, GENERIC_ALL, nullptr, &g_shareH);
-        if (FAILED(hr)) { FileLog("[DX12] CreateSharedHandle failed: " + std::to_string(hr), LOG_ERROR); return; }
+            D3D12_HEAP_PROPERTIES hp = {};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
 
-        auto allocInfo = s_Device->GetResourceAllocationInfo(0, 1, &desc);
-        g_totalBytes = allocInfo.SizeInBytes;
-        g_rowPitch = (uint64_t)width * 4 * sizeof(float);
+            HRESULT hr = s_Device->CreateCommittedResource(
+                    &hp,
+                    D3D12_HEAP_FLAG_SHARED,
+                    &bufDesc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    nullptr,
+                    IID_PPV_ARGS(&s_StagingTexs[i]));
+            if (FAILED(hr))
+            {
+                FileLog("[DX12] CreateCommittedResource (buffer) failed: " + std::to_string(hr), LOG_ERROR);
+                return;
+            }
 
+            
+            hr = s_Device->CreateSharedHandle(
+                    s_StagingTexs[i],
+                    nullptr,
+                    GENERIC_ALL,
+                    nullptr,
+                    &g_shareHs[i]);
+            if (FAILED(hr))
+            {
+                FileLog("[DX12] CreateSharedHandle failed: " + std::to_string(hr), LOG_ERROR);
+                return;
+            }
+
+            
+            cudaExternalMemoryHandleDesc memDesc = {};
+            memDesc.type                = cudaExternalMemoryHandleTypeD3D12Resource;
+            memDesc.handle.win32.handle = g_shareHs[i];
+            memDesc.size                = totalBytes;
+            memDesc.flags               = cudaExternalMemoryDedicated;
+            cudaError_t impErr = cudaImportExternalMemory(&g_extMems[i], &memDesc);
+            FileLog(std::string("cudaImportExternalMemory -> ") + cudaGetErrorString(impErr), LOG_VERBOSE);
+            if (impErr != cudaSuccess)
+                return;
+        }
+    }
+
+    
+    s_Allocator->Reset();
+    ID3D12GraphicsCommandList* cmdList = nullptr;
+    HRESULT hrCL = s_Device->CreateCommandList(
+            0,
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            s_Allocator,
+            nullptr,
+            IID_PPV_ARGS(&cmdList));
+    if (FAILED(hrCL) || !cmdList)
+    {
+        FileLog("[DX12] CreateCommandList failed: " + std::to_string(hrCL), LOG_ERROR);
+        return;
+    }
+
+    for (int i = 0; i < 4; ++i)
+    {
+        
+        D3D12_RESOURCE_BARRIER br = {};
+        br.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        br.Transition.pResource   = s_Backbuffers[i];
+        br.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        br.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmdList->ResourceBarrier(1, &br);
+
+        
+        D3D12_RESOURCE_DESC texDesc = s_Backbuffers[i]->GetDesc();
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout = {};
         UINT numRows = 0;
-        UINT64 rowBytes = 0;
-        UINT64 total = 0;
-        s_Device->GetCopyableFootprints(&desc, 0, 1, 0, &layout, &numRows, &rowBytes, &total);
+        UINT64 rowBytes = 0, totalBytes = 0;
+        s_Device->GetCopyableFootprints(
+                &texDesc, 0, 1, 0,
+                &layout, &numRows, &rowBytes, &totalBytes);
 
-        g_rowPitch = layout.Footprint.RowPitch;
-        g_totalBytes = total;
+        
+        D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+        srcLoc.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        srcLoc.pResource        = s_Backbuffers[i];
+        srcLoc.SubresourceIndex = 0;
 
-        FileLog("D3D12 layout: RowPitch=" + std::to_string(g_rowPitch) + " bytes=" + std::to_string(g_totalBytes), LOG_VERBOSE);
+        D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+        dstLoc.Type             = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dstLoc.pResource        = s_StagingTexs[i];
+        dstLoc.PlacedFootprint  = layout;
 
-        cudaExternalMemoryHandleDesc memDesc = {};
-        memDesc.type = cudaExternalMemoryHandleTypeD3D12Resource;
-        memDesc.handle.win32.handle = g_shareH;
-        memDesc.size = g_totalBytes;
-        memDesc.flags = cudaExternalMemoryDedicated;
-        cudaError_t impErr = cudaImportExternalMemory(&g_extMem, &memDesc);
-        FileLog(std::string("cudaImportExternalMemory -> ") + cudaGetErrorString(impErr) + ", g_extMem=" + std::to_string((uintptr_t)g_extMem), LOG_VERBOSE);
-        if (impErr != cudaSuccess) return;
+        cmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+        
+        std::swap(br.Transition.StateBefore, br.Transition.StateAfter);
+        cmdList->ResourceBarrier(1, &br);
     }
 
-    s_Allocator->Reset();
-
-    ID3D12GraphicsCommandList* cmdList = nullptr;
-    HRESULT hrCL = s_Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_Allocator, nullptr, IID_PPV_ARGS(&cmdList));
-    if (FAILED(hrCL) || !cmdList) { FileLog("[DX12] CreateCommandList failed: " + std::to_string(hrCL)); return; }
-
-    D3D12_RESOURCE_BARRIER barrier = {};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = s_Backbuffer;
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    cmdList->ResourceBarrier(1, &barrier);
-
-    cmdList->CopyResource(s_StagingTex, s_Backbuffer);
-
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    cmdList->ResourceBarrier(1, &barrier);
     cmdList->Close();
-
-    FileLog("[DX12] Command list recorded & closed.", LOG_VERBOSE);
-
-    UINT64 unityFenceValue = s_GfxD3D12->ExecuteCommandList(cmdList, 0, nullptr);
+    UINT64 fenceValue = s_GfxD3D12->ExecuteCommandList(cmdList, 0, nullptr);
     cmdList->Release();
 
-    g_lastWidth = width;
+    s_Fence->SetEventOnCompletion(fenceValue, s_FenceEvent);
+    RegisterWaitForSingleObject(
+            &g_WaitHandle,
+            s_FenceEvent,
+            FrameFenceCallback,
+            nullptr,
+            INFINITE,
+            WT_EXECUTEONLYONCE);
+
+    g_lastWidth  = width;
     g_lastHeight = height;
-
-    s_Fence->SetEventOnCompletion(unityFenceValue, s_FenceEvent);
-
-    RegisterWaitForSingleObject(&g_WaitHandle, s_FenceEvent, FrameFenceCallback, nullptr, INFINITE, WT_EXECUTEONLYONCE);
     FileLog("[DX12] CaptureFrameAsync scheduled callback.", LOG_VERBOSE);
 }
 
-extern "C" HERMESARC_API void CALLBACK FrameFenceCallback(PVOID, BOOLEAN)
+
+extern "C" HERMESARC_API void CALLBACK FrameFenceCallback(PVOID /*context*/, BOOLEAN /*timedOut*/)
 {
     FileLog(">>> FrameFenceCallback start", LOG_VERBOSE);
 
-    void* devPtr = nullptr;
-    cudaExternalMemoryBufferDesc bufDesc = {0, g_totalBytes, 0};
+    for (int i = 0; i < 4; ++i)
+    {
+        
+        void* devPtr = nullptr;
+        cudaExternalMemoryBufferDesc bufDesc = {};
+        bufDesc.offset = 0;
+        bufDesc.size   = g_totalBytesArr[i];
+        bufDesc.flags  = 0;
 
-    cudaError_t mapErr = cudaExternalMemoryGetMappedBuffer(&devPtr, g_extMem, &bufDesc);
-    FileLog(std::string("cudaExternalMemoryGetMappedBuffer -> ") + cudaGetErrorString(mapErr), LOG_ERROR);
-    if (mapErr != cudaSuccess) return;
+        cudaError_t mapErr = cudaExternalMemoryGetMappedBuffer(
+                &devPtr, g_extMems[i], &bufDesc);
+        FileLog(std::string("  cudaExternalMemoryGetMappedBuffer -> ")
+                + cudaGetErrorString(mapErr),
+                LOG_VERBOSE);
+        if (mapErr != cudaSuccess)
+            return;
 
-    std::vector<int64_t> dims    = { (int64_t)g_lastHeight, (int64_t)g_lastWidth, 4 };
-    std::vector<int64_t> strides = { (int64_t)(g_rowPitch / sizeof(float)), 4, 1 };
+        
+        int64_t H = static_cast<int64_t>(g_lastHeight);
+        int64_t W = static_cast<int64_t>(g_lastWidth);
+        int64_t C = 4;
+        int64_t rowPitchElems = static_cast<int64_t>(g_rowPitchArr[i] / sizeof(float));
 
-    FileLog("  dims    = [" + std::to_string(dims[0]) + "," + std::to_string(dims[1]) + "," + std::to_string(dims[2]) + "]", LOG_VERBOSE);
-    FileLog("  strides = [" + std::to_string(strides[0]) + "," + std::to_string(strides[1]) + "," + std::to_string(strides[2]) + "]", LOG_VERBOSE);
+        std::vector<int64_t> dims    = { H, W, C };
+        std::vector<int64_t> strides = { rowPitchElems, C, 1 };
 
-    cudaError_t last = cudaGetLastError();
-    FileLog(std::string("  cudaGetLastError before from_blob: ") + cudaGetErrorString(last), LOG_ERROR);
+        try
+        {
+            auto t1 = torch::from_blob(
+                    devPtr,
+                    dims,
+                    strides,
+                    &noopCudaDeleter,
+                    torch::TensorOptions()
+                            .dtype(torch::kFloat32)
+                            .device(torch::kCUDA, 0)
+            );
+            auto t2 = t1.clone();
+            g_lastTensor[i] = t2;
 
-    try {
-        auto t1 = torch::from_blob(
-                devPtr, dims, strides, &noopCudaDeleter,
-                torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, 0)
-        );
-        FileLog("  from_blob succeeded", LOG_VERBOSE);
-
-        last = cudaGetLastError();
-        FileLog(std::string("  cudaGetLastError after from_blob: ") + cudaGetErrorString(last), LOG_VERBOSE);
-
-        auto t2 = t1.clone();
-        g_lastTensor = t2;
-        FileLog("  clone() succeeded", LOG_VERBOSE);
-        FileLog(std::to_string(t2[0][0][0].item<float>()), LOG_VERBOSE);
-        last = cudaGetLastError();
-        FileLog(std::string("  cudaGetLastError after clone: ") + cudaGetErrorString(last), LOG_VERBOSE);
-
-        float meanVal = t2.mean().item<float>();
-        FileLog("  mean() = " + std::to_string(meanVal), LOG_VERBOSE);
-
-        if (g_FrameReadyCb) {
-            g_FrameReadyCb(meanVal);
-            FileLog("  managed callback invoked", LOG_VERBOSE);
-        } else {
-            FileLog("  no managed callback registered", LOG_VERBOSE);
+            
+            float meanVal = t2.mean().item<float>();
+            FileLog("  mean() = " + std::to_string(meanVal), LOG_VERBOSE);
+            if (g_FrameReadyCb)
+                g_FrameReadyCb(meanVal);
         }
-    } catch (const std::exception& e) {
-        FileLog(std::string("  EXCEPTION: ") + e.what(), LOG_ERROR);
+        catch (const std::exception& e)
+        {
+            FileLog(std::string("  EXCEPTION: ") + e.what(), LOG_ERROR);
+        }
     }
-
-    last = cudaGetLastError();
-    FileLog(std::string("<<< FrameFenceCallback end, final cudaGetLastError: ") + cudaGetErrorString(last), LOG_ERROR);
 }
 
 extern "C" HERMESARC_API void PushLastTensorToUnity(void* renderTexPtr, unsigned width, unsigned height)
 {
     ID3D12Resource* dstRes = reinterpret_cast<ID3D12Resource*>(renderTexPtr);
-    if (!s_Device || !s_StagingTex || !g_extMem || !dstRes || !g_lastTensor.defined())
+    if (!s_Device || !dstRes ||
+        !g_lastTensor[0].defined() ||
+        !g_lastTensor[1].defined() ||
+        !g_lastTensor[2].defined() ||
+        !g_lastTensor[3].defined())
     {
         FileLog("[DX12] PushLastTensorToUnity called before init", LOG_ERROR);
         return;
     }
 
+    
+    if (!s_OutputStagingBuf)
+    {
+        
+        D3D12_RESOURCE_DESC dstDesc = dstRes->GetDesc();
+
+        
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout = {};
+        UINT numRows = 0;
+        UINT64 rowBytes = 0, totalBytes = 0;
+        s_Device->GetCopyableFootprints(
+                &dstDesc,        
+                0, 1, 0,
+                &layout, &numRows, &rowBytes, &totalBytes);
+
+        g_outputRowPitch   = layout.Footprint.RowPitch;
+        g_outputTotalBytes = totalBytes;
+        
+        D3D12_RESOURCE_DESC bufDesc = {};
+        bufDesc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bufDesc.Alignment        = 0;
+        bufDesc.Width            = totalBytes;
+        bufDesc.Height           = 1;
+        bufDesc.DepthOrArraySize = 1;
+        bufDesc.MipLevels        = 1;
+        bufDesc.Format           = DXGI_FORMAT_UNKNOWN;
+        bufDesc.SampleDesc.Count = 1;
+        bufDesc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bufDesc.Flags            = D3D12_RESOURCE_FLAG_NONE;
+
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        HRESULT hr = s_Device->CreateCommittedResource(
+                &hp,
+                D3D12_HEAP_FLAG_SHARED,
+                &bufDesc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                nullptr,
+                IID_PPV_ARGS(&s_OutputStagingBuf));
+        if (FAILED(hr)) {
+            FileLog("[DX12] CreateCommittedResource (output buffer) failed: " + std::to_string(hr), LOG_ERROR);
+            return;
+        }
+        
+        hr = s_Device->CreateSharedHandle(
+                s_OutputStagingBuf,
+                nullptr,
+                GENERIC_ALL,
+                nullptr,
+                &g_outputShareH);
+        if (FAILED(hr)) {
+            FileLog("[DX12] CreateSharedHandle (output) failed: " + std::to_string(hr), LOG_ERROR);
+            return;
+        }
+
+        cudaExternalMemoryHandleDesc memDesc{};
+        memDesc.type                = cudaExternalMemoryHandleTypeD3D12Resource;
+        memDesc.handle.win32.handle = g_outputShareH;
+        memDesc.size                = totalBytes;
+        memDesc.flags               = cudaExternalMemoryDedicated;
+        cudaError_t impErr = cudaImportExternalMemory(&g_outputExtMem, &memDesc);
+        if (impErr != cudaSuccess) {
+            FileLog(std::string("[DX12] cudaImportExternalMemory (output) -> ") + cudaGetErrorString(impErr), LOG_ERROR);
+            return;
+        }
+
+        FileLog("[DX12] Allocated output ROW-MAJOR buffer + imported into CUDA", LOG_VERBOSE);
+    }
+
+    at::Tensor normal = g_lastTensor[0].contiguous();
+    at::Tensor depth  = g_lastTensor[1].contiguous();
+    at::Tensor tex    = g_lastTensor[2].contiguous();
+    at::Tensor render = torch::pow(g_lastTensor[3].contiguous(),1/2.2f);
+
+    auto normal_c = normal.slice(2, 0, 3);
+    auto depth_r  = depth.select(2, 0).unsqueeze(2);
+    auto tex_c    = tex.slice(2, 0, 3);
+    auto render_c = render.slice(2, 0, 3);
+
+    at::Tensor input_hw_c = torch::cat({ depth_r, normal_c, render_c, tex_c }, 2).contiguous();
+    at::Tensor input = input_hw_c.permute({2,0,1}).unsqueeze(0).contiguous();
+
+
+    at::Tensor result;
+    try {
+        result = net.forward({input.flip({2})}).toTensor().flip({2});
+        result = result.clamp_(0.0, 1.0).nan_to_num_(0.0, 0.0, 0.0);
+    } catch (const c10::Error& e) {
+        FileLog(std::string("Torch C++ error in forward(): ") + e.what(), LOG_ERROR);
+        return;
+    }
+
+    if (g_logVerbosity == LOG_DEBUG)
+    {
+        at::Tensor input_to_save = input.to(at::kCPU);
+        torch::save(input_to_save, "input.pth");
+        at::Tensor output_to_save = result.to(at::kCPU);
+        torch::save(output_to_save, "output.pth");
+    }
+    
+    result = result.squeeze(0).permute({1,2,0}).contiguous();
+    {
+        int64_t H = result.size(0), W = result.size(1);
+        at::Tensor ones = torch::ones({H,W,1}, result.options());
+        result = torch::cat({ result, ones }, 2);
+    }
+    torch::cuda::synchronize();
+    
     void* dstPtr = nullptr;
-    cudaExternalMemoryBufferDesc bd = {0, g_totalBytes, 0};
-    auto err = cudaExternalMemoryGetMappedBuffer(&dstPtr, g_extMem, &bd);
-    if (err != cudaSuccess)
-    {
-        FileLog(std::string("[DX12] Map for write failed: ") + cudaGetErrorString(err), LOG_ERROR);
+    cudaExternalMemoryBufferDesc bufDesc{};
+    bufDesc.offset = 0;
+    bufDesc.size   = g_outputTotalBytes;
+    bufDesc.flags  = 0;
+
+    cudaError_t mapErr = cudaExternalMemoryGetMappedBuffer(&dstPtr, g_outputExtMem, &bufDesc);
+    if (mapErr != cudaSuccess) {
+        FileLog(std::string("[DX12] cudaExternalMemoryGetMappedBuffer (output) -> ") + cudaGetErrorString(mapErr), LOG_ERROR);
         return;
     }
 
-    at::Tensor t = g_lastTensor;
-    if (!t.is_contiguous()) t = t.contiguous();
+    size_t srcPitchBytes = width * 4 * sizeof(float);
+    size_t dstPitchBytes = g_outputRowPitch;
+    size_t copyHeight    = height;
 
-    size_t rowBytes = (size_t)width * 4 * sizeof(float);
-    err = cudaMemcpy2D(dstPtr, g_rowPitch, t.data_ptr(), rowBytes, rowBytes, height, cudaMemcpyDeviceToDevice);
-    if (err != cudaSuccess)
-    {
-        FileLog(std::string("[DX12] cudaMemcpy2D failed: ") + cudaGetErrorString(err), LOG_ERROR);
+    cudaError_t memcpyErr = cudaMemcpy2D(
+            dstPtr,
+            dstPitchBytes,
+            result.data_ptr(),
+            srcPitchBytes,
+            srcPitchBytes,
+            copyHeight,
+            cudaMemcpyDeviceToDevice);
+    if (memcpyErr != cudaSuccess) {
+        FileLog(std::string("[DX12] cudaMemcpy2D (output) failed: ") + cudaGetErrorString(memcpyErr), LOG_ERROR);
         return;
     }
+    torch::cuda::synchronize();
 
-    FileLog("[DX12] Tensor → staging copy succeeded", LOG_VERBOSE);
+    FileLog("[DX12] Copied NN result into output buffer", LOG_VERBOSE);
 
+    
+    s_Allocator->Reset();
     ID3D12GraphicsCommandList* cmdList = nullptr;
-    HRESULT hr = s_Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_Allocator, nullptr, IID_PPV_ARGS(&cmdList));
-    if (FAILED(hr) || !cmdList)
-    {
-        FileLog("[DX12] CreateCommandList failed: " + std::to_string(hr), LOG_ERROR);
+    HRESULT hrCL = s_Device->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            s_Allocator, nullptr,
+            IID_PPV_ARGS(&cmdList));
+    if (FAILED(hrCL) || !cmdList) {
+        FileLog("[DX12] CreateCommandList failed (output copy): " + std::to_string(hrCL), LOG_ERROR);
         return;
     }
 
+    
     D3D12_RESOURCE_BARRIER br[2] = {};
-    br[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    br[0].Transition.pResource = s_StagingTex;
-    br[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    br[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    br[0].Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    br[0].Transition.pResource   = s_OutputStagingBuf;
+    br[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    br[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
     br[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
-    br[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    br[1].Transition.pResource = dstRes;
+    br[1].Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    br[1].Transition.pResource   = dstRes;
     br[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    br[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    br[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
     br[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
     cmdList->ResourceBarrier(2, br);
-    cmdList->CopyResource(dstRes, s_StagingTex);
+
+    
+    D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+    srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    srcLoc.pResource = s_OutputStagingBuf;
+
+    
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout2 = {};
+    UINT rows2 = 0;
+    UINT64 rb2 = 0, tb2 = 0;
+    {
+        D3D12_RESOURCE_DESC dstDesc2 = dstRes->GetDesc();
+        s_Device->GetCopyableFootprints(&dstDesc2, 0, 1, 0, &layout2, &rows2, &rb2, &tb2);
+    }
+    srcLoc.PlacedFootprint = layout2;
+
+    D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+    dstLoc.Type            = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dstLoc.pResource       = dstRes;
+    dstLoc.SubresourceIndex = 0;
+
+    
+    cmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+    
     std::swap(br[0].Transition.StateBefore, br[0].Transition.StateAfter);
     std::swap(br[1].Transition.StateBefore, br[1].Transition.StateAfter);
     cmdList->ResourceBarrier(2, br);
-    cmdList->Close();
 
+    cmdList->Close();
     s_GfxD3D12->ExecuteCommandList(cmdList, 0, nullptr);
     cmdList->Release();
 
-    FileLog("[DX12] PushLastTensorToUnity completed", LOG_VERBOSE);
+    FileLog("[DX12] PushLastTensorToUnity output copy complete", LOG_VERBOSE);
 }
 
 extern "C" HERMESARC_API const char* get_version()
 {
-    return "HermesArc version 0.90";
+    return "HermesArc version 0.93c.dev3";
 }

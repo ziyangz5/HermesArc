@@ -13,7 +13,7 @@ find_package(CUDA REQUIRED)
 
 #-------------------------------------------------------------------------------
 # Find Unity PluginAPI headers (for IUnityGraphicsD3D12.h, IUnityInterface.h)
-set(UNITY_EDITOR_DIR "C:/Program Files/Unity/Hub/Editor/2022.3.23f1/Editor/Data")
+set(UNITY_EDITOR_DIR "C:/Program Files/Unity/Hub/Editor/6000.0.37f1/Editor/Data")
 find_path(UNITY_PLUGINAPI_INCLUDE
         NAMES IUnityGraphicsD3D12.h IUnityInterface.h IUnityGraphics.h
         HINTS

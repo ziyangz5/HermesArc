@@ -9,8 +9,8 @@
 
 extern "C" HERMESARC_API const char* get_version();
 
-extern "C" HERMESARC_API void InitializeDX12Interop(void* backbufferPtr, unsigned width, unsigned height);
+extern "C" HERMESARC_API bool InitializeNeuralNetwork(const char* model_path);
 
-extern "C" HERMESARC_API float CaptureFrameToTensor(unsigned width, unsigned height);
+extern "C" HERMESARC_API void CaptureFrameAsync(void* ptr0, void* ptr1, void* ptr2, void* ptr3,unsigned width, unsigned height);
 
 #endif // HERMESARC_LIBRARY_H
