@@ -19,7 +19,10 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using UnityEngine;
 using UnityEngine.Rendering;
+using UnityEngine.UI;                             
+using UnityEngine.Experimental.Rendering;         
 using AOT;
+using System.Collections;
 
 public class UnityDx12CudaAsync : MonoBehaviour
 {
@@ -29,75 +32,90 @@ public class UnityDx12CudaAsync : MonoBehaviour
     public delegate void FrameReadyCallbackType(float mean);
 
     [DllImport(PluginName, CallingConvention = CallingConvention.Cdecl)]
-    private static extern void RegisterFrameReadyCallback(FrameReadyCallbackType callback);
+    static extern void RegisterFrameReadyCallback(FrameReadyCallbackType cb);
 
     [DllImport(PluginName, CallingConvention = CallingConvention.Cdecl)]
-    private static extern void CaptureFrameAsync(IntPtr backbufferPtr, uint width, uint height);
+    static extern void CaptureFrameAsync(
+        IntPtr nb0, IntPtr nb1, IntPtr nb2, IntPtr nb3,
+        uint width, uint height);
 
     [DllImport(PluginName, CallingConvention = CallingConvention.Cdecl)]
-    private static extern IntPtr get_version();
-
+    static extern void PushLastTensorToUnity(
+        IntPtr nb, uint width, uint height);
 
     [DllImport(PluginName, CallingConvention = CallingConvention.Cdecl)]
-    private static extern void PushLastTensorToUnity(IntPtr backbufferPtr, uint width, uint height);
+    static extern bool InitializeNeuralNetwork(string modelPath);
 
+    [DllImport(PluginName, CallingConvention = CallingConvention.Cdecl)]
+    static extern IntPtr get_version();
 
+    [Header("Assign in Inspector")]
+    public Camera sourceCamera;    // your camera for CaptureFrameAsync
+    public RawImage outputUI;      // the RawImage you want to drive
 
-    public RenderTexture sourceTexture;
-    public RenderTexture targetTexture;
-    private FrameReadyCallbackType frameReadyDelegate;
-    private static SynchronizationContext unityContext;
+    RenderTexture floatRT;
+    Material gammaMaterial;
+    FrameReadyCallbackType frameCb;
+    static SynchronizationContext unityContext;
 
-    bool test = true;
     void Start()
     {
-
         unityContext = SynchronizationContext.Current;
 
+        string ver = Marshal.PtrToStringAnsi(get_version());
+        Debug.Log($"[DX12CudaAsync] HermesArc v{ver}");
+        if (!InitializeNeuralNetwork("simple_rotation_512x512.pth"))
+            Debug.LogError("[DX12CudaAsync] NN load failed");
 
-        var ver = Marshal.PtrToStringAnsi(get_version());
-        Debug.Log($"Loaded HermesArc: {ver}");
+        int w = Screen.width, h = Screen.height;
+        var desc = new RenderTextureDescriptor(w, h,
+            GraphicsFormat.R32G32B32A32_SFloat,
+            depthBufferBits: 0);
+        desc.enableRandomWrite = true;
+        desc.sRGB = false;  // linear
+        floatRT = new RenderTexture(desc);
+        floatRT.Create();
 
-        if (sourceTexture == null)
+        var shader = Shader.Find("UI/GammaCorrected");
+        if (shader == null)
+            Debug.LogError("Could not find UI/GammaCorrected.shader");
+        gammaMaterial = new Material(shader);
+
+        if (outputUI != null)
         {
-            Debug.LogWarning("No sourceTexture assigned; creating 512×512 dummy.");
-            sourceTexture = new RenderTexture(512, 512, 0, RenderTextureFormat.ARGB32);
+            outputUI.texture = floatRT;
+            outputUI.material = gammaMaterial;
         }
 
-
-        targetTexture.enableRandomWrite = true;
-        targetTexture.Create();
-        sourceTexture.enableRandomWrite = true;
-        sourceTexture.Create();
-
-
-        frameReadyDelegate = OnFrameReady;
-        RegisterFrameReadyCallback(frameReadyDelegate);
+        frameCb = OnFrameReady;
+        RegisterFrameReadyCallback(frameCb);
+        StartCoroutine(CaptureLoop(0.014286f));
     }
 
-    void FixedUpdate()
+    IEnumerator CaptureLoop(float dt)
     {
-        if (targetTexture == null) return;
-        GL.IssuePluginEvent(0);
-        if (test)
+        while (true)
         {
-            CaptureFrameAsync(
-                sourceTexture.GetNativeTexturePtr(),
-                (uint)sourceTexture.width,
-                (uint)sourceTexture.height
-            );
-            test = false;
-        }
-        else
-        {
-            PushLastTensorToUnity(
-                targetTexture.GetNativeTexturePtr(),
-                (uint)targetTexture.width,
-                (uint)targetTexture.height
-            );
-            test = true;
-        }
+            yield return new WaitForSeconds(dt);
 
+            var rtN = Shader.GetGlobalTexture("_MyGBufferNormalCapture") as RenderTexture;
+            var rtD = Shader.GetGlobalTexture("_MyGBufferDepthCapture") as RenderTexture;
+            var rtT = Shader.GetGlobalTexture("_MyGBufferTexCapture") as RenderTexture;
+            var rtS = sourceCamera.targetTexture;
+
+            CaptureFrameAsync(
+                rtN.GetNativeTexturePtr(),
+                rtD.GetNativeTexturePtr(),
+                rtT.GetNativeTexturePtr(),
+                rtS.GetNativeTexturePtr(),
+                (uint)rtN.width, (uint)rtN.height);
+
+            yield return new WaitForSeconds(dt);
+
+            PushLastTensorToUnity(
+                floatRT.GetNativeTexturePtr(),
+                (uint)floatRT.width, (uint)floatRT.height);
+        }
     }
 
     void OnDestroy()
@@ -106,16 +124,13 @@ public class UnityDx12CudaAsync : MonoBehaviour
     }
 
     [MonoPInvokeCallback(typeof(FrameReadyCallbackType))]
-    private static void OnFrameReady(float mean)
+    static void OnFrameReady(float mean)
     {
         if (unityContext != null)
-        {
-            unityContext.Post(_ =>
-            {
-                Debug.Log($"{mean}");
-
-            }, null);
-        }
+            unityContext.Post(_ => Debug.Log($"Frame mean: {mean}"), null);
+        else
+            Debug.Log($"Frame mean: {mean}");
     }
 }
+
 ```
