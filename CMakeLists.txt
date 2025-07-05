@@ -1,9 +1,7 @@
 cmake_minimum_required(VERSION 3.26)
 project(HermesArc)
 
-#-------------------------------------------------------------------------------
-# Find libtorch
-# (Assumes libtorch is installed in C:\Users\xshuj\lib\libtorch)
+# Sorry for my bad Cmake config, but for now just replace it with your libtorch dir
 list(APPEND CMAKE_PREFIX_PATH "C:/Users/xshuj/lib/libtorch/lib")
 find_package(Torch REQUIRED)
 
@@ -12,7 +10,7 @@ find_package(Torch REQUIRED)
 find_package(CUDA REQUIRED)
 
 #-------------------------------------------------------------------------------
-# Find Unity PluginAPI headers (for IUnityGraphicsD3D12.h, IUnityInterface.h)
+# Sorry for my bad Cmake config, but for now just replace it with your Unity Plugin API dir
 set(UNITY_EDITOR_DIR "C:/Program Files/Unity/Hub/Editor/6000.0.37f1/Editor/Data")
 find_path(UNITY_PLUGINAPI_INCLUDE
         NAMES IUnityGraphicsD3D12.h IUnityInterface.h IUnityGraphics.h
@@ -25,7 +23,6 @@ if(NOT UNITY_PLUGINAPI_INCLUDE)
 endif()
 
 #-------------------------------------------------------------------------------
-# Find D3D12 and DXGI libraries (Windows SDK)
 find_library(D3D12_LIB d3d12 HINTS "$ENV{WINDIR}/System32")
 find_library(DXGI_LIB  dxgi  HINTS "$ENV{WINDIR}/System32")
 
